@@ -1,0 +1,220 @@
+---
+- name: Configure EC2 instance and deploy FastAPI app
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dir: /opt/app
+    venv_dir: /opt/app/.venv
+    app_user: appuser
+    app_group: appuser
+    app_port: 8000
+    gunicorn_workers: 4
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # System packages
+    # -------------------------------------------------------------------------
+    - name: Update apt cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - python3.11
+          - python3.11-venv
+          - python3.11-dev
+          - python3-pip
+          - nginx
+          - rsync
+          - curl
+          - build-essential
+        state: present
+
+    # -------------------------------------------------------------------------
+    # Non-root application user
+    # -------------------------------------------------------------------------
+    - name: Create application group
+      group:
+        name: "{{ app_group }}"
+        state: present
+
+    - name: Create application user
+      user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        shell: /bin/false
+        home: /opt/app
+        create_home: false
+        system: true
+        state: present
+
+    # -------------------------------------------------------------------------
+    # App directory ownership
+    # -------------------------------------------------------------------------
+    - name: Ensure /opt/app is owned by appuser
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0755"
+
+    # -------------------------------------------------------------------------
+    # Python virtual environment and dependencies
+    # -------------------------------------------------------------------------
+    - name: Create Python 3.11 virtual environment
+      command: python3.11 -m venv {{ venv_dir }}
+      args:
+        creates: "{{ venv_dir }}/bin/activate"
+      become_user: "{{ app_user }}"
+
+    - name: Upgrade pip inside venv
+      command: "{{ venv_dir }}/bin/pip install --upgrade pip"
+      become_user: "{{ app_user }}"
+
+    - name: Check if requirements.txt exists
+      stat:
+        path: "{{ app_dir }}/requirements.txt"
+      register: req_file
+
+    - name: Install Python dependencies from requirements.txt
+      command: "{{ venv_dir }}/bin/pip install -r {{ app_dir }}/requirements.txt"
+      become_user: "{{ app_user }}"
+      when: req_file.stat.exists
+
+    - name: Install mandatory packages (gunicorn, uvicorn, fastapi) if not in requirements
+      command: >
+        {{ venv_dir }}/bin/pip install
+        "gunicorn>=21.2.0"
+        "uvicorn[standard]>=0.29.0"
+        "fastapi>=0.110.0"
+        "python-multipart>=0.0.9"
+        "aiofiles>=23.2.1"
+      become_user: "{{ app_user }}"
+
+    # -------------------------------------------------------------------------
+    # systemd service for gunicorn/uvicorn
+    # -------------------------------------------------------------------------
+    - name: Write systemd unit file for app
+      copy:
+        dest: /etc/systemd/system/app.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=FastAPI application (gunicorn + uvicorn workers)
+          After=network.target
+
+          [Service]
+          Type=notify
+          User={{ app_user }}
+          Group={{ app_group }}
+          WorkingDirectory={{ app_dir }}
+          Environment=PORT={{ app_port }}
+          Environment=APP_ENV=production
+          ExecStart={{ venv_dir }}/bin/gunicorn app.main:app \
+            -k uvicorn.workers.UvicornWorker \
+            -w {{ gunicorn_workers }} \
+            -b 0.0.0.0:{{ app_port }} \
+            --timeout 120 \
+            --access-logfile - \
+            --error-logfile -
+          Restart=always
+          RestartSec=5
+          KillMode=mixed
+          TimeoutStopSec=30
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: true
+
+    - name: Enable and start app service
+      systemd:
+        name: app
+        enabled: true
+        state: restarted
+
+    # -------------------------------------------------------------------------
+    # nginx - proxy port 80 -> 127.0.0.1:8000
+    # -------------------------------------------------------------------------
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Write nginx site config
+      copy:
+        dest: /etc/nginx/sites-available/app
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+
+              server_name _;
+
+              access_log /var/log/nginx/app_access.log;
+              error_log  /var/log/nginx/app_error.log;
+
+              location / {
+                  proxy_pass         http://127.0.0.1:8000;
+                  proxy_http_version 1.1;
+                  proxy_set_header   Host              $host;
+                  proxy_set_header   X-Real-IP         $remote_addr;
+                  proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+                  proxy_set_header   X-Forwarded-Proto $scheme;
+                  proxy_set_header   Upgrade           $http_upgrade;
+                  proxy_set_header   Connection        "upgrade";
+                  proxy_read_timeout 300s;
+                  proxy_connect_timeout 75s;
+              }
+          }
+
+    - name: Enable nginx app site
+      file:
+        src: /etc/nginx/sites-available/app
+        dest: /etc/nginx/sites-enabled/app
+        state: link
+
+    - name: Test nginx configuration
+      command: nginx -t
+      register: nginx_test
+      changed_when: false
+
+    - name: Enable and restart nginx
+      systemd:
+        name: nginx
+        enabled: true
+        state: restarted
+
+    # -------------------------------------------------------------------------
+    # Final health check from within the instance
+    # -------------------------------------------------------------------------
+    - name: Wait for gunicorn to be ready on port 8000
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ app_port }}"
+        timeout: 60
+        state: started
+
+    - name: Verify app responds at /health via nginx
+      uri:
+        url: "http://127.0.0.1/health"
+        method: GET
+        status_code: 200
+        timeout: 30
+      retries: 6
+      delay: 5
+      register: health_result
+      until: health_result.status == 200
